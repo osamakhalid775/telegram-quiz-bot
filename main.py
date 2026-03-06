@@ -4,16 +4,15 @@ import logging
 import asyncio
 import random
 import sqlite3
-from datetime import datetime
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional
 
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
     Application,
     CommandHandler,
-    MessageHandler,
     CallbackQueryHandler,
+    MessageHandler,
     filters,
     ContextTypes,
 )
@@ -141,33 +140,30 @@ def get_random_questions(count: int = 5) -> List[Dict]:
         return []
     return random.sample(QUESTIONS, min(count, len(QUESTIONS)))
 
-# ======================== حالة الألعاب النشطة (في الذاكرة) ========================
+# ======================== حالة الألعاب النشطة ========================
 
 active_games: Dict[int, Dict] = {}
 
 # ========================= دوال مساعدة =========================
 
-def format_question(question: Dict, q_num: int, total: int) -> str:
-    """تنسيق نص السؤال"""
-    if question["type"] == "choice":
-        options_text = "\n".join(
-            [f"{i+1}. {opt}" for i, opt in enumerate(question["options"])]
-        )
-        return (
-            f"📝 **السؤال {q_num}/{total}**\n"
-            f"{question['text']}\n\n"
-            f"{options_text}\n\n"
-            f"⏳ لديك 20 ثانية للإجابة (أرسل رقم الإجابة)"
-        )
-    else:  # riddle
-        return (
-            f"🧩 **لغز {q_num}/{total}**\n"
-            f"{question['text']}\n\n"
-            f"⏳ لديك 30 ثانية للإجابة (أرسل الإجابة نصياً)"
-        )
+def format_question_text(question: Dict, q_num: int, total: int) -> str:
+    """تنسيق نص السؤال فقط (بدون خيارات)"""
+    return (
+        f"📝 **السؤال {q_num}/{total}**\n"
+        f"{question['text']}\n"
+        f"⏳ لديك 20 ثانية للإجابة"
+    )
+
+def build_options_keyboard(question: Dict, game_id: str) -> InlineKeyboardMarkup:
+    """بناء أزرار الخيارات مع بيانات callback تحتوي على معرف اللعبة ورقم الخيار"""
+    keyboard = []
+    for i, option in enumerate(question["options"]):
+        callback_data = f"{game_id}:{i}"
+        keyboard.append([InlineKeyboardButton(option, callback_data=callback_data)])
+    return InlineKeyboardMarkup(keyboard)
 
 async def send_question(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
-    """إرسال السؤال الحالي للمجموعة"""
+    """إرسال السؤال الحالي للمجموعة مع أزرار الخيارات"""
     game = active_games.get(chat_id)
     if not game or game["status"] != "playing":
         return
@@ -180,41 +176,48 @@ async def send_question(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
 
     question = questions[q_index]
     total = len(questions)
-    text = format_question(question, q_index + 1, total)
+    text = format_question_text(question, q_index + 1, total)
 
-    # إرسال السؤال
-    msg = await context.bot.send_message(chat_id, text)
+    # إنشاء معرف فريد لهذه اللعبة (chat_id + index) لاستخدامه في callback
+    game_id = f"{chat_id}_{q_index}"
+
+    # بناء الأزرار
+    reply_markup = build_options_keyboard(question, game_id)
+
+    # إرسال السؤال مع الأزرار
+    msg = await context.bot.send_message(chat_id, text, reply_markup=reply_markup, parse_mode="Markdown")
 
     # حفظ معلومات الجولة الحالية
     game["current_q_msg_id"] = msg.message_id
     game["q_start_time"] = asyncio.get_event_loop().time()
     game["answered_users"] = set()
     game["correct_answer_given"] = False
+    game["current_game_id"] = game_id
 
-    # تحديد المهلة
-    timeout = 20 if question["type"] == "choice" else 30
-    asyncio.create_task(handle_question_timeout(chat_id, context, timeout))
+    # جدولة إنهاء السؤال بعد 20 ثانية
+    asyncio.create_task(handle_question_timeout(chat_id, context, 20, msg.message_id))
 
-async def handle_question_timeout(chat_id: int, context: ContextTypes.DEFAULT_TYPE, delay: int):
+async def handle_question_timeout(chat_id: int, context: ContextTypes.DEFAULT_TYPE, delay: int, msg_id: int):
     """معالجة انتهاء وقت السؤال"""
     await asyncio.sleep(delay)
     game = active_games.get(chat_id)
-    if not game or game["status"] != "playing":
+    if not game or game["status"] != "playing" or game["current_q_msg_id"] != msg_id:
         return
 
     if not game.get("correct_answer_given"):
         question = game["questions"][game["current_q_index"]]
-        if question["type"] == "choice":
-            correct_option = question["options"][question["correct_index"]]
-            await context.bot.send_message(
-                chat_id,
-                f"⏰ انتهى الوقت!\nالإجابة الصحيحة: {correct_option}"
-            )
-        else:
-            await context.bot.send_message(
-                chat_id,
-                f"⏰ انتهى الوقت!\nالإجابة الصحيحة: {question['answer']}"
-            )
+        correct_option = question["options"][question["correct_index"]]
+        # إرسال رسالة بالإجابة الصحيحة
+        await context.bot.send_message(
+            chat_id,
+            f"⏰ انتهى الوقت!\nالإجابة الصحيحة: **{correct_option}**",
+            parse_mode="Markdown"
+        )
+        # تعطيل الأزرار
+        try:
+            await context.bot.edit_message_reply_markup(chat_id, msg_id, reply_markup=None)
+        except:
+            pass
 
     # الانتقال للسؤال التالي
     game["current_q_index"] += 1
@@ -263,13 +266,39 @@ async def end_game(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
 
     await context.bot.send_message(chat_id, result_text, parse_mode="Markdown")
 
+# ======================== إعداد قائمة الأوامر (Commands Menu) ========================
+
+async def set_commands(application: Application):
+    """تعيين قائمة الأوامر التي تظهر عند كتابة /"""
+    commands = [
+        ("start", "بدء البوت والترحيب"),
+        ("play", "بدء لعبة جديدة في المجموعة"),
+        ("menu", "عرض أزرار الأوامر"),
+        ("score", "عرض نقاطك الإجمالية"),
+        ("score_group", "عرض نقاطك في هذه المجموعة"),
+        ("leaderboard", "ترتيب اللاعبين في المجموعة"),
+        ("help", "عرض المساعدة"),
+        ("endgame", "إنهاء اللعبة الحالية (للمشرفين)"),
+    ]
+    await application.bot.set_my_commands(commands)
+
 # ======================== معالجات الأوامر ========================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """رسالة الترحيب مع عرض الأزرار"""
+    keyboard = [
+        [KeyboardButton("/play"), KeyboardButton("/menu")],
+        [KeyboardButton("/score"), KeyboardButton("/leaderboard")],
+        [KeyboardButton("/help")]
+    ]
+    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=False)
+    
     await update.message.reply_text(
         "مرحباً! أنا بوت أسئلة وألغاز جماعي.\n"
+        "استخدم الأزرار أدناه أو اكتب الأوامر مباشرة.\n"
         "لبدء لعبة في المجموعة، أرسل /play\n"
-        "للأوامر المتاحة: /help"
+        "لعرض الأزرار مرة أخرى، أرسل /menu",
+        reply_markup=reply_markup
     )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -280,15 +309,26 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /score - عرض نقاطك الإجمالية
 /score_group - عرض نقاطك في هذه المجموعة
 /leaderboard - ترتيب أفضل اللاعبين في هذه المجموعة
+/menu - عرض أزرار الأوامر
 /help - عرض هذه المساعدة
 
 🎮 **كيفية اللعب:**
 - أرسل /play واختر عدد الأسئلة.
-- سيتم طرح الأسئلة واحداً تلو الآخر.
-- أسرع إجابة صحيحة تحصل على نقطة.
+- سيتم طرح الأسئلة واحداً تلو الآخر مع أزرار للإجابة.
+- أسرع من يضغط على الزر الصحيح يحصل على نقطة.
 - في نهاية اللعبة يظهر الفائز.
 """
     await update.message.reply_text(help_text, parse_mode="Markdown")
+
+async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """عرض قائمة الأزرار التفاعلية"""
+    keyboard = [
+        [KeyboardButton("/play"), KeyboardButton("/score")],
+        [KeyboardButton("/leaderboard"), KeyboardButton("/score_group")],
+        [KeyboardButton("/help"), KeyboardButton("/menu")]
+    ]
+    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=False)
+    await update.message.reply_text("📋 اختر أمراً من الأزرار أدناه:", reply_markup=reply_markup)
 
 async def play(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -296,27 +336,29 @@ async def play(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ توجد لعبة نشطة حالياً. انهها أولاً بـ /endgame")
         return
 
-    # التحقق من وجود أسئلة
     if not QUESTIONS:
         await update.message.reply_text("❌ عذراً، لا توجد أسئلة متاحة حالياً. راجع المشرف.")
         return
 
     keyboard = [[
-        InlineKeyboardButton("5", callback_data="5"),
-        InlineKeyboardButton("10", callback_data="10"),
-        InlineKeyboardButton("15", callback_data="15"),
+        InlineKeyboardButton("5", callback_data="play_5"),
+        InlineKeyboardButton("10", callback_data="play_10"),
+        InlineKeyboardButton("15", callback_data="play_15"),
     ]]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text("🎮 اختر عدد الأسئلة:", reply_markup=reply_markup)
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """معالجة الضغط على الأزرار (اختيار عدد الأسئلة أو إجابة)"""
     query = update.callback_query
     await query.answer()
     chat_id = query.message.chat_id
     user_id = query.from_user.id
+    data = query.data
 
-    if query.data.isdigit():
-        num_questions = int(query.data)
+    # إذا كان الضغط على زر اختيار عدد الأسئلة
+    if data.startswith("play_"):
+        num_questions = int(data.split("_")[1])
         active_games[chat_id] = {
             "status": "playing",
             "players": {},
@@ -330,6 +372,58 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await asyncio.sleep(5)
         await send_question(chat_id, context)
+        return
+
+    # معالجة إجابة على سؤال (البيانات تأتي بصيغة game_id:option_index)
+    try:
+        game_id, option_index = data.split(":")
+        option_index = int(option_index)
+        last_underscore = game_id.rfind("_")
+        if last_underscore == -1:
+            return
+        original_chat_id = int(game_id[:last_underscore])
+        q_index = int(game_id[last_underscore+1:])
+    except Exception as e:
+        logger.error(f"خطأ في تحليل callback data: {e}")
+        return
+
+    game = active_games.get(original_chat_id)
+    if not game or game["status"] != "playing":
+        await query.edit_message_text("❌ اللعبة انتهت أو لم تعد موجودة.")
+        return
+
+    if game["current_q_index"] != q_index:
+        await query.message.reply_text("⚠️ هذا السؤال قد انتهى بالفعل.")
+        return
+
+    if user_id in game.get("answered_users", set()):
+        await query.message.reply_text("⚠️ لقد أجبت بالفعل على هذا السؤال.")
+        return
+
+    question = game["questions"][q_index]
+    correct = (option_index == question["correct_index"])
+
+    if correct:
+        game["answered_users"].add(user_id)
+        if not game.get("correct_answer_given"):
+            game["correct_answer_given"] = True
+            game["players"][user_id] = game["players"].get(user_id, 0) + 1
+
+            first_name = query.from_user.first_name
+            await context.bot.send_message(
+                original_chat_id,
+                f"✅ {first_name} كان الأسرع! (+1 نقطة)"
+            )
+
+            # تعطيل جميع الأزرار بعد الإجابة الصحيحة الأولى
+            try:
+                await query.message.edit_reply_markup(reply_markup=None)
+            except:
+                pass
+        else:
+            await query.message.reply_text("✅ إجابة صحيحة، ولكن هناك من سبقك!")
+    else:
+        await query.message.reply_text("❌ إجابة خاطئة!")
 
 async def endgame(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -339,7 +433,6 @@ async def endgame(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ لا توجد لعبة نشطة حالياً.")
         return
 
-    # التحقق من صلاحية المشرف
     chat_member = await context.bot.get_chat_member(chat_id, user_id)
     if chat_member.status not in ["administrator", "creator"]:
         await update.message.reply_text("⚠️ هذا الأمر متاح فقط للمشرفين.")
@@ -349,20 +442,17 @@ async def endgame(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ تم إنهاء اللعبة.")
 
 async def score(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """عرض النقاط الإجمالية للمستخدم"""
     user_id = update.effective_user.id
     points = get_user_total_points(user_id)
     await update.message.reply_text(f"🏅 مجموع نقاطك الإجمالية: {points}")
 
 async def score_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """عرض نقاط المستخدم في هذه المجموعة"""
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
     points = get_group_points(chat_id, user_id)
     await update.message.reply_text(f"📊 نقاطك في هذه المجموعة: {points}")
 
 async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """عرض ترتيب المجموعة"""
     chat_id = update.effective_chat.id
     top_users = get_group_leaderboard(chat_id, 10)
 
@@ -381,75 +471,72 @@ async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(text, parse_mode="Markdown")
 
+# معالج الرسائل النصية العادية (لتحويل النقر على أزرار الـ Reply Keyboard إلى أوامر)
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """معالجة الإجابات"""
-    chat_id = update.effective_chat.id
-    user_id = update.effective_user.id
-    text = update.message.text.strip()
-
-    game = active_games.get(chat_id)
-    if not game or game["status"] != "playing":
-        return
-
-    if "current_q_index" not in game or game["current_q_index"] >= len(game["questions"]):
-        return
-
-    question = game["questions"][game["current_q_index"]]
-
-    if user_id in game.get("answered_users", set()):
-        return  # سبق أن أجاب
-
-    correct = False
-    if question["type"] == "choice":
-        if text.isdigit():
-            choice_index = int(text) - 1
-            if choice_index == question["correct_index"]:
-                correct = True
-    else:  # riddle
-        if text.strip().lower() == question["answer"].lower():
-            correct = True
-
-    if correct:
-        game["answered_users"].add(user_id)
-        if not game.get("correct_answer_given"):
-            game["correct_answer_given"] = True
-            game["players"][user_id] = game["players"].get(user_id, 0) + 1
-
-            first_name = update.effective_user.first_name
-            await context.bot.send_message(
-                chat_id,
-                f"✅ {first_name} كان الأسرع! (+1 نقطة)"
-            )
-        else:
-            await update.message.reply_text("✅ إجابة صحيحة، ولكن هناك من سبقك!")
-    # else: يمكن تجاهل الإجابة الخاطئة أو الرد برسالة خاصة (اختياري)
+    text = update.message.text
+    # إذا كان النص يطابق أمراً من الأزرار، نوجهه إلى المعالج المناسب
+    if text == "/play":
+        await play(update, context)
+    elif text == "/menu":
+        await menu_command(update, context)
+    elif text == "/score":
+        await score(update, context)
+    elif text == "/score_group":
+        await score_group(update, context)
+    elif text == "/leaderboard":
+        await leaderboard(update, context)
+    elif text == "/help":
+        await help_command(update, context)
+    elif text == "/endgame":
+        await endgame(update, context)
+    # أي نص آخر يمكن تجاهله (أو يمكن إعلام المستخدم)
 
 # ======================== تشغيل البوت ========================
 
 def main():
     if not TOKEN:
-        logger.error("لم يتم تعيين BOT_TOKEN في متغيرات البيئة.")
+        logger.error("❌ BOT_TOKEN غير موجود في متغيرات البيئة.")
         return
 
-    # تهيئة قاعدة البيانات
-    init_db()
-    logger.info("تم تهيئة قاعدة البيانات SQLite.")
+    global QUESTIONS
+    QUESTIONS = load_questions_from_json()
+    if not QUESTIONS:
+        logger.error("❌ لم يتم تحميل أي أسئلة. تأكد من وجود questions.json.")
+        # يمكن المتابعة ولكن البوت لن يعمل بشكل صحيح
+
+    try:
+        init_db()
+        logger.info("✅ تم تهيئة قاعدة البيانات SQLite.")
+    except Exception as e:
+        logger.exception("❌ فشل في تهيئة قاعدة البيانات: %s", e)
+        return
 
     application = Application.builder().token(TOKEN).build()
+
+    # تعيين قائمة الأوامر
+    asyncio.get_event_loop().run_until_complete(set_commands(application))
 
     # إضافة المعالجات
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("menu", menu_command))
     application.add_handler(CommandHandler("play", play))
     application.add_handler(CommandHandler("endgame", endgame))
     application.add_handler(CommandHandler("score", score))
     application.add_handler(CommandHandler("score_group", score_group))
     application.add_handler(CommandHandler("leaderboard", leaderboard))
     application.add_handler(CallbackQueryHandler(button_callback))
+    # معالج الرسائل النصية (للأزرار)
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    logger.info("البوت يعمل...")
+    logger.info("✅ البوت يعمل...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        logger.exception("حدث خطأ غير متوقع: %s", e)
+        import sys
+        print(f"FATAL ERROR: {e}", file=sys.stderr)
+        raise
