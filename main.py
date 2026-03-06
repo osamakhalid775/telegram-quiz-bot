@@ -17,6 +17,9 @@ from telegram.ext import (
     ContextTypes,
 )
 
+# استيراد خادم الويب الوهمي (لابد من وجود ملف server.py)
+from server import keep_alive
+
 # تحميل متغيرات البيئة
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
@@ -489,7 +492,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await help_command(update, context)
     elif text == "/endgame":
         await endgame(update, context)
-    # أي نص آخر يمكن تجاهله (أو يمكن إعلام المستخدم)
+    # أي نص آخر يمكن تجاهله
 
 # ======================== تشغيل البوت ========================
 
@@ -528,6 +531,10 @@ def main():
     application.add_handler(CallbackQueryHandler(button_callback))
     # معالج الرسائل النصية (للأزرار)
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    # تشغيل خادم الويب الوهمي (لأجل Web Service على Render)
+    keep_alive()
+    logger.info(f"✅ خادم الويب الوهمي يعمل على المنفذ {os.getenv('PORT', '8080')}")
 
     logger.info("✅ البوت يعمل...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
